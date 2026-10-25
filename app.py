@@ -73,8 +73,11 @@ if column not in df.columns
 ]
 
 if missing:
-st.error("Your CSV is missing these columns: " + ", ".join(missing))
-st.stop()
+   st.error(
+      "Your CSV is missing these columns: "
+      + ", ".join(missing)
+   )
+   st.stop()
 
 df = df[REQUIRED_COLUMNS].copy()
 
