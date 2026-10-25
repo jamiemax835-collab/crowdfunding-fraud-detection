@@ -58,14 +58,14 @@ type=["csv"]
 )
 
 if uploaded_file is not None:
-try:
-df = pd.read_csv(uploaded_file)
-except Exception as exc:
-st.error(f"Could not read the CSV file: {exc}")
-st.stop()
+   try:
+      df = pd.read_csv(uploaded_file)
+   except Exception as exc:
+      st.error(f"Could not read the CSV file: {exc}")
+      st.stop()
 else:
-df = pd.DataFrame(SAMPLE_DATA)
-st.sidebar.success("Using illustrative sample donations.")
+  df = pd.DataFrame(SAMPLE_DATA)
+  st.sidebar.success("Using illustrative sample donations.")
 
 missing = [
 column for column in REQUIRED_COLUMNS
