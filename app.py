@@ -90,7 +90,8 @@ numeric_columns = [
 ]
 
 for column in numeric_columns:
-df[column] = pd.to_numeric(df[column], errors="coerce")
+   df[column] = pd.to_numeric(df[column],
+errors="coerce")
 
 df = df.dropna(subset=numeric_columns)
 
