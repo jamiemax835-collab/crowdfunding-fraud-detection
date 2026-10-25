@@ -1,6 +1,10 @@
+
+import hashlib
+
 import streamlit as st
 import pandas as pd
 from sklearn.ensemble import IsolationForest
+from sqlalchemy import create_engine, text
 
 st.set_page_config(
     page_title="Crowdfunding Fraud Detection",
@@ -49,7 +53,123 @@ REQUIRED_COLUMNS = [
     "country_mismatch"
 ]
 
+NUMERIC_COLUMNS = [
+    "amount",
+    "donor_age_days",
+    "donations_last_24h",
+    "payment_failures",
+    "country_mismatch"
+]
+
+
+# DATABASE CONNECTION
+@st.cache_resource
+def get_engine():
+    return create_engine(
+        st.secrets["database"]["url"],
+        pool_pre_ping=True
+    )
+
+
+def initialize_database(engine):
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS donations_history (
+                record_id BIGSERIAL PRIMARY KEY,
+                batch_key TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                donation_id TEXT NOT NULL,
+                amount DOUBLE PRECISION NOT NULL,
+                donor_age_days DOUBLE PRECISION NOT NULL,
+                donations_last_24h DOUBLE PRECISION NOT NULL,
+                payment_failures DOUBLE PRECISION NOT NULL,
+                country_mismatch DOUBLE PRECISION NOT NULL,
+                anomaly_score DOUBLE PRECISION NOT NULL,
+                status TEXT NOT NULL,
+                review_notes TEXT NOT NULL,
+                UNIQUE (batch_key, donation_id)
+            )
+        """))
+
+
+def save_donations(engine, data, batch_key):
+    records = data[
+        REQUIRED_COLUMNS + [
+            "Anomaly score",
+            "Status",
+            "Review notes"
+        ]
+    ].copy()
+
+    records = records.rename(columns={
+        "Anomaly score": "anomaly_score",
+        "Status": "status",
+        "Review notes": "review_notes"
+    })
+
+    records["batch_key"] = batch_key
+
+    columns = [
+        "batch_key",
+        "donation_id",
+        "amount",
+        "donor_age_days",
+        "donations_last_24h",
+        "payment_failures",
+        "country_mismatch",
+        "anomaly_score",
+        "status",
+        "review_notes"
+    ]
+
+    rows = records[columns].to_dict(orient="records")
+
+    query = text("""
+        INSERT INTO donations_history (
+            batch_key, donation_id, amount, donor_age_days,
+            donations_last_24h, payment_failures,
+            country_mismatch, anomaly_score, status, review_notes
+        )
+        VALUES (
+            :batch_key, :donation_id, :amount, :donor_age_days,
+            :donations_last_24h, :payment_failures,
+            :country_mismatch, :anomaly_score, :status, :review_notes
+        )
+        ON CONFLICT (batch_key, donation_id) DO NOTHING
+    """)
+
+    with engine.begin() as connection:
+        result = connection.execute(query, rows)
+
+    return result.rowcount
+
+
+def load_history(engine):
+    with engine.connect() as connection:
+        return pd.read_sql(
+            text("""
+                SELECT
+                    record_id,
+                    created_at,
+                    donation_id,
+                    amount,
+                    donor_age_days,
+                    donations_last_24h,
+                    payment_failures,
+                    country_mismatch,
+                    anomaly_score AS "Anomaly score",
+                    status AS "Status",
+                    review_notes AS "Review notes"
+                FROM donations_history
+                ORDER BY created_at DESC, record_id DESC
+            """),
+            connection
+        )
+
+
+# SIDEBAR AND DATA INPUT
 st.sidebar.header("Donation data")
+
 uploaded_file = st.sidebar.file_uploader(
     "Upload a donations CSV file",
     type=["csv"]
@@ -78,33 +198,46 @@ if missing:
     st.stop()
 
 df = df[REQUIRED_COLUMNS].copy()
+df["donation_id"] = df["donation_id"].astype("string").str.strip()
 
-numeric_columns = [
-    "amount",
-    "donor_age_days",
-    "donations_last_24h",
-    "payment_failures",
-    "country_mismatch"
-]
+if df["donation_id"].isna().any() or (
+    df["donation_id"] == ""
+).any():
+    st.error("Every donation must have a donation ID.")
+    st.stop()
 
-for column in numeric_columns:
-    df[column] = pd.to_numeric(
-        df[column], errors="coerce"
-    )
+if df["donation_id"].duplicated().any():
+    st.error("Each donation ID must be unique within the uploaded dataset.")
+    st.stop()
 
-df = df.dropna(subset=numeric_columns)
+for column in NUMERIC_COLUMNS:
+    df[column] = pd.to_numeric(df[column], errors="coerce")
+
+if df[NUMERIC_COLUMNS].isna().any().any():
+    st.error("Some numeric fields are empty or invalid. Please correct your CSV.")
+    st.stop()
 
 if len(df) < 5:
     st.error("Please provide at least 5 valid donation records.")
     st.stop()
 
-if (df[numeric_columns] < 0).any().any():
+if not df[NUMERIC_COLUMNS].apply(
+    lambda column: column.map(lambda value: abs(value) != float("inf"))
+).all().all():
+    st.error("Numeric fields must contain finite values.")
+    st.stop()
+
+if (df[NUMERIC_COLUMNS] < 0).any().any():
     st.error("Numeric donation features cannot contain negative values.")
     st.stop()
 
-df["country_mismatch"] = df["country_mismatch"].clip(0, 1)
+if not df["country_mismatch"].isin([0, 1]).all():
+    st.error("country_mismatch must contain only 0 or 1.")
+    st.stop()
 
-features = df[numeric_columns].copy()
+
+# FRAUD DETECTION
+features = df[NUMERIC_COLUMNS].copy()
 
 model = IsolationForest(
     contamination=0.12,
@@ -118,6 +251,7 @@ df["Status"] = [
     "Suspicious — review" if prediction == -1 else "Normal"
     for prediction in predictions
 ]
+
 
 def explain_row(row):
     reasons = []
@@ -138,8 +272,11 @@ def explain_row(row):
 
     return "; ".join(reasons)
 
+
 df["Review notes"] = df.apply(explain_row, axis=1)
 
+
+# DASHBOARD OVERVIEW
 total = len(df)
 suspicious = int(
     (df["Status"] == "Suspicious — review").sum()
@@ -164,9 +301,52 @@ st.bar_chart(df["Status"].value_counts())
 st.subheader("Donation amount overview")
 st.bar_chart(df.set_index("donation_id")["amount"])
 
+
+# SAVE CURRENT ANALYSIS
+st.subheader("Save donation history")
+
+st.write(
+    "Save this analysis to your online database. "
+    "The same dataset will not be saved twice under the same batch."
+)
+
+batch_data = df[REQUIRED_COLUMNS].sort_values(
+    "donation_id"
+).to_json(orient="records")
+
+batch_key = hashlib.sha256(
+    batch_data.encode("utf-8")
+).hexdigest()
+
+if st.button("Save donations to database", type="primary"):
+    try:
+        engine = get_engine()
+        initialize_database(engine)
+        saved_count = save_donations(engine, df, batch_key)
+
+        if saved_count:
+            st.success(
+                f"Saved {saved_count} donation record(s) to history."
+            )
+        else:
+            st.info(
+                "This dataset has already been saved. "
+                "No duplicate records were added."
+            )
+
+    except Exception as exc:
+        st.error(
+            "Could not save to the database. Check your Streamlit "
+            "Secrets and Neon connection settings."
+        )
+        st.caption(f"Technical details: {exc}")
+
+
+# SEARCH AND FILTER
 st.subheader("Search and filter donations")
 
 search = st.text_input("Search by donation ID")
+
 status_filter = st.selectbox(
     "Filter by status",
     ["All", "Normal", "Suspicious — review"]
@@ -186,7 +366,10 @@ if status_filter != "All":
 
 st.dataframe(filtered, use_container_width=True)
 
+
+# FLAGGED DONATIONS
 st.subheader("Review flagged donations")
+
 flagged = df[df["Status"] == "Suspicious — review"]
 
 if flagged.empty:
@@ -209,6 +392,41 @@ else:
         use_container_width=True
     )
 
+
+# PERSISTENT DATABASE HISTORY
+st.subheader("Saved donation history")
+
+try:
+    engine = get_engine()
+    initialize_database(engine)
+    history = load_history(engine)
+
+    if history.empty:
+        st.info(
+            "No donation history has been saved yet. "
+            "Use the Save donations to database button above."
+        )
+    else:
+        st.metric("Saved donation records", len(history))
+        st.dataframe(history, use_container_width=True)
+
+        history_csv = history.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            label="Download saved history (CSV)",
+            data=history_csv,
+            file_name="saved_donation_history.csv",
+            mime="text/csv"
+        )
+
+except Exception:
+    st.warning(
+        "Database history is currently unavailable. "
+        "Check your Streamlit Secrets and Neon connection."
+    )
+
+
+# DOWNLOAD CURRENT ANALYSIS
 csv_data = df.to_csv(index=False).encode("utf-8")
 
 st.download_button(
